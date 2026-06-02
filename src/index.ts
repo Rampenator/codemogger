@@ -11,6 +11,7 @@ import { chunkFile } from "./chunk/treesitter.ts";
 import { detectLanguage } from "./chunk/languages.ts";
 import { preprocessQuery, type QueryMode } from "./search/query.ts";
 import { rrfMerge } from "./search/rank.ts";
+import { applyScope, type ScopeMode } from "./search/scope.ts";
 import type { Embedder } from "./embed/types.ts";
 
 export type { SearchResult, IndexedFile, Codebase } from "./db/store.ts";
@@ -24,6 +25,8 @@ export interface SearchOptions {
   threshold?: number;
   includeSnippet?: boolean;
   mode?: SearchMode;
+  scope?: string;
+  scopeMode?: ScopeMode;
 }
 
 export type IndexPhase = "scan" | "hash" | "chunk" | "embed" | "cleanup" | "fts";
@@ -292,39 +295,45 @@ export class CodeIndex {
     const threshold = opts?.threshold ?? 0.0;
     const includeSnippet = opts?.includeSnippet ?? false;
     const mode = opts?.mode ?? "semantic";
+    const scope = opts?.scope?.trim();
+    const scopeMode = opts?.scopeMode ?? "global";
+    const filterScope = scope && scopeMode === "filter" ? scope : undefined;
+    const candidateLimit = scope && scopeMode === "boost" ? Math.max(limit * 5, limit + 20) : limit;
+
+    function finish(results: SearchResult[]): SearchResult[] {
+      const scoped = applyScope(results, { scope, scopeMode }, limit);
+      return threshold > 0 ? scoped.filter((r) => r.score >= threshold) : scoped;
+    }
 
     // Verify the DB is in a readable state before searching
     await this.verifySearchable(store);
 
     if (mode === "semantic") {
       const [queryVec] = (await this.embedder([query])) as [number[]];
-      const results = await store.vectorSearch(queryVec, limit, includeSnippet);
-      return threshold > 0
-        ? results.filter((r) => r.score >= threshold)
-        : results;
+      const results = await store.vectorSearch(queryVec, candidateLimit, includeSnippet, filterScope);
+      return finish(results);
     }
 
     // Keyword path: preprocess query for FTS
     const processed = preprocessQuery(query, "keywords");
     if (!processed.trim()) return [];
 
-    const ftsResults = await store.ftsSearch(processed, limit, includeSnippet);
+    const ftsResults = await store.ftsSearch(processed, candidateLimit, includeSnippet, filterScope);
 
     if (mode === "keyword") {
-      return threshold > 0
-        ? ftsResults.filter((r) => r.score >= threshold)
-        : ftsResults;
+      return finish(ftsResults);
     }
 
     // Hybrid: combine keyword + semantic via RRF
     const [queryVec] = (await this.embedder([query])) as [number[]];
     const vecResults = await store.vectorSearch(
       queryVec,
-      limit,
+      candidateLimit,
       includeSnippet,
+      filterScope,
     );
-    const merged = rrfMerge(ftsResults, vecResults, limit);
-    return threshold > 0 ? merged.filter((r) => r.score >= threshold) : merged;
+    const merged = rrfMerge(ftsResults, vecResults, candidateLimit);
+    return finish(merged);
   }
 
   /**

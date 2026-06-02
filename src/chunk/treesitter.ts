@@ -7,6 +7,7 @@ import type { LanguageConfig } from "./languages.ts"
 // 150 lines is roughly the context window a model can attend to without losing detail;
 // going much larger hurts retrieval precision.
 const MAX_CHUNK_LINES = 150
+const TEST_DSL_CALLS = new Set(["describe", "it", "test"])
 
 let parserReady: Promise<void> | null = null
 let parser: Parser | null = null
@@ -160,6 +161,12 @@ function extractSignature(node: SyntaxNode, sourceLines: string[]): string {
   return sourceLines[startLine]?.trim() ?? ""
 }
 
+function extractStringLiteral(node: SyntaxNode): string {
+  const fragment = node.namedChildren.find(c => c.type === "string_fragment")
+  if (fragment) return fragment.text
+  return node.text.replace(/^['"`]|['"`]$/g, "")
+}
+
 /** Chunk a single source file using tree-sitter AST */
 export async function chunkFile(
   filePath: string,
@@ -179,10 +186,10 @@ export async function chunkFile(
   const topLevelSet = new Set(config.topLevelNodes)
   const splitSet = new Set(config.splitNodes)
 
-  function makeChunk(node: SyntaxNode, kind: string): CodeChunk {
+  function makeChunk(node: SyntaxNode, kind: string, nameOverride?: string): CodeChunk {
     const startLine = node.startPosition.row + 1  // 1-based
     const endLine = node.endPosition.row + 1
-    const name = extractName(node)
+    const name = nameOverride ?? extractName(node)
     const signature = extractSignature(node, sourceLines)
     const snippet = node.text
 
@@ -197,6 +204,45 @@ export async function chunkFile(
       startLine,
       endLine,
       fileHash,
+    }
+  }
+
+  function testDslName(node: SyntaxNode): string | null {
+    if (node.type !== "call_expression") return null
+    const callee = node.childForFieldName("function") ?? node.namedChildren[0]
+    if (!callee) return null
+    if (callee.type === "identifier" && TEST_DSL_CALLS.has(callee.text)) return callee.text
+    if (callee.type === "member_expression") {
+      const root = callee.namedChildren[0]
+      if (root?.type === "identifier" && TEST_DSL_CALLS.has(root.text)) return root.text
+    }
+    return null
+  }
+
+  function testDslChunkName(node: SyntaxNode): string {
+    const args = node.childForFieldName("arguments") ?? node.namedChildren.find(c => c.type === "arguments")
+    const firstArg = args?.namedChildren[0]
+    if (firstArg?.type === "string" || firstArg?.type === "template_string") {
+      return extractStringLiteral(firstArg)
+    }
+    return ""
+  }
+
+  function collectTestDslCalls(node: SyntaxNode): void {
+    const callName = testDslName(node)
+    if (callName) {
+      chunks.push(makeChunk(node, "test", testDslChunkName(node)))
+      const args = node.childForFieldName("arguments") ?? node.namedChildren.find(c => c.type === "arguments")
+      for (const arg of args?.namedChildren ?? []) {
+        if (arg.type === "arrow_function" || arg.type === "function_expression") {
+          collectTestDslCalls(arg)
+        }
+      }
+      return
+    }
+
+    for (const child of node.namedChildren) {
+      collectTestDslCalls(child)
     }
   }
 
@@ -336,6 +382,9 @@ export async function chunkFile(
   // Walk top-level children of the root node
   for (const child of tree.rootNode.children) {
     processNode(child)
+    if (child.type === "expression_statement") {
+      collectTestDslCalls(child)
+    }
   }
 
   tree.delete()

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { program } from "commander"
 import { CodeIndex, projectDbPath, type SearchMode, type IndexProgress } from "../src/index.ts"
+import type { ScopeMode } from "../src/search/scope.ts"
 import { localEmbed, LOCAL_MODEL_NAME } from "../src/embed/local.ts"
 import { formatJson } from "../src/format/json.ts"
 import { formatText } from "../src/format/text.ts"
@@ -128,7 +129,9 @@ program
   .option("--format <fmt>", "output format: json|text", "json")
   .option("--snippet", "include code snippet in output")
   .option("--mode <mode>", "search mode: semantic|keyword|hybrid", "semantic")
-  .action(async (query: string, opts: { limit: string; threshold: string; format: string; snippet?: boolean; mode: string }) => {
+  .option("--scope <path>", "prefer or filter results under a path/repo")
+  .option("--scope-mode <mode>", "scope mode: global|boost|filter", "global")
+  .action(async (query: string, opts: { limit: string; threshold: string; format: string; snippet?: boolean; mode: string; scope?: string; scopeMode: string }) => {
     const dbPath = resolveDbPath()
     const db = new CodeIndex({ dbPath, embedder: localEmbed, embeddingModel: LOCAL_MODEL_NAME })
     try {
@@ -138,6 +141,8 @@ program
         threshold: parseFloat(opts.threshold),
         includeSnippet: opts.snippet,
         mode: opts.mode as SearchMode,
+        scope: opts.scope,
+        scopeMode: opts.scopeMode as ScopeMode,
       })
       const elapsed = Math.round(performance.now() - start)
 

@@ -22,6 +22,20 @@ function makeIndex(dbPath: string) {
   return new CodeIndex({ dbPath, embedder, embeddingModel: "test-model" });
 }
 
+function vector(first: number, second: number) {
+  return [first, second, ...Array.from({ length: 382 }, () => 0)];
+}
+
+function makeScopedIndex(dbPath: string) {
+  const embedder = async (texts: string[]) =>
+    texts.map((text) => {
+      if (text.includes("/service-a/")) return vector(0.8, 0.2);
+      if (text.includes("/service-b/")) return vector(1, 0);
+      return vector(1, 0);
+    });
+  return new CodeIndex({ dbPath, embedder, embeddingModel: "test-model" });
+}
+
 test("indexes a directory and returns chunk count", async () => {
   await writeFile(join(dir, "foo.ts"), `
 export function add(a: number, b: number): number {
@@ -62,4 +76,51 @@ test("re-indexing unchanged files does not duplicate chunks", async () => {
   // Second run: no new chunks (file hash unchanged, already skipped)
   expect(r2.skipped).toBe(1);
   expect(r1.chunks).toBeGreaterThan(0);
+});
+
+test("re-index removes files that become excluded", async () => {
+  await writeFile(join(dir, "keep.ts"), "export function keepFunction() {}");
+  await writeFile(join(dir, "gone.ts"), "export function goneFunction() {}");
+  const dbPath = join(dir, "test.db");
+  const idx = makeIndex(dbPath);
+
+  const r1 = await idx.index(dir);
+  expect(r1.chunks).toBeGreaterThan(0);
+  expect(await idx.search("goneFunction", { mode: "keyword" })).toHaveLength(1);
+
+  await writeFile(join(dir, ".gitignore"), "gone.ts\n");
+  const r2 = await idx.index(dir);
+
+  expect(r2.removed).toBe(1);
+  expect((await idx.listFiles()).map(f => f.filePath).sort()).toEqual([join(dir, "keep.ts")]);
+  expect(await idx.search("goneFunction", { mode: "keyword" })).toHaveLength(0);
+  await idx.close();
+});
+
+test("scoped search supports global boost and filter", async () => {
+  await mkdir(join(dir, "service-a"), { recursive: true });
+  await mkdir(join(dir, "service-b"), { recursive: true });
+  await writeFile(join(dir, "service-a", "match.ts"), "export function needle() { return \"inside\"; }");
+  await writeFile(join(dir, "service-b", "match.ts"), "export function needle() { return \"outside\"; }");
+  const idx = makeScopedIndex(join(dir, "test.db"));
+  await idx.index(dir);
+
+  const global = await idx.search("needle", { mode: "semantic", limit: 2 });
+  expect(global[0]!.filePath).toContain("/service-b/");
+
+  const filtered = await idx.search("needle", { mode: "semantic", limit: 2, scope: "service-a", scopeMode: "filter" });
+  expect(filtered).toHaveLength(1);
+  expect(filtered[0]!.filePath).toContain("/service-a/");
+
+  const boosted = await idx.search("needle", { mode: "semantic", limit: 2, scope: "service-a", scopeMode: "boost" });
+  expect(boosted).toHaveLength(2);
+  expect(boosted[0]!.filePath).toContain("/service-a/");
+  expect(boosted.some(r => r.filePath.includes("/service-b/"))).toBe(true);
+
+  for (const mode of ["keyword", "hybrid"] as const) {
+    const results = await idx.search("needle", { mode, limit: 5, scope: "service-a", scopeMode: "filter" });
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every(r => r.filePath.includes("/service-a/"))).toBe(true);
+  }
+  await idx.close();
 });

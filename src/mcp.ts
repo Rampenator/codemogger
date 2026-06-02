@@ -7,7 +7,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 import { CodeIndex, projectDbPath } from "./index.ts"
 import { localEmbed, LOCAL_MODEL_NAME } from "./embed/local.ts"
-import type { Codebase } from "./db/store.ts"
+import type { Codebase, SearchResult } from "./db/store.ts"
+import type { ScopeMode } from "./search/scope.ts"
 
 const cwd = process.cwd()
 
@@ -20,9 +21,10 @@ function findCurrentCodebase(codebases: Codebase[]): Codebase | undefined {
 
 /** Build the codemogger_search description dynamically based on index state */
 function buildSearchDescription(current: Codebase | undefined): string {
-  const base = `Search an indexed codebase for relevant code. Two modes:
+  const base = `Search an indexed codebase for relevant code. Three modes:
 - "semantic": natural language queries like "how does authentication work?" - uses vector embeddings
 - "keyword": precise identifier lookup like "BTreeCursor" or "handleRequest" - uses full-text search on function/type names
+- "hybrid": combines semantic and keyword results
 
 Returns matching code chunks with file path, name, kind, signature, and line numbers.`
 
@@ -31,7 +33,7 @@ Returns matching code chunks with file path, name, kind, signature, and line num
 - Understanding how a feature or concept is implemented across many files (semantic mode)
 - Discovering relevant code when you don't know exact filenames or identifiers (semantic mode)
 
-Use includeSnippet=true to get the full source code of each result, eliminating the need for a separate Read call.`
+Defaults to compact first-probe results. Use includeSnippet=true to get full source snippets for promising results.`
 
   if (current) {
     return `This project (${current.rootPath}) is indexed and searchable - ${current.chunkCount} chunks from ${current.fileCount} files.
@@ -44,6 +46,25 @@ ${usage}`
   return `${base}
 
 ${usage}`
+}
+
+export const mcpSearchInputSchema = {
+  query: z.string().describe("The search query - natural language for semantic/hybrid mode, identifier/keyword for keyword mode"),
+  mode: z.enum(["semantic", "keyword", "hybrid"]).default("semantic").describe("Search mode: 'semantic' for conceptual queries, 'keyword' for exact identifier lookup, 'hybrid' for both"),
+  limit: z.number().int().min(1).max(50).default(10).describe("Maximum number of results to return"),
+  includeSnippet: z.boolean().default(false).describe("Include the full code snippet in results (can be large)"),
+  scope: z.string().optional().describe("Optional path or repo to prefer/filter, e.g. isecure-ws-channel-poller or src/app/pages/query-tool"),
+  scopeMode: z.enum(["global", "boost", "filter"]).default("global").describe("Scope mode: 'global' ignores scope, 'boost' promotes scoped results, 'filter' excludes outside results"),
+}
+
+export function formatMcpSearchResults(results: SearchResult[]): string {
+  return results.map((r, i) => {
+    const name = r.name ? ` ${r.name}` : ""
+    let entry = `${i + 1}. ${r.filePath}:${r.startLine}-${r.endLine} [${r.kind}]${name}`
+    if (r.signature) entry += ` ${r.signature}`
+    if (r.snippet) entry += `\n\`\`\`\n${r.snippet}\n\`\`\``
+    return entry
+  }).join("\n\n")
 }
 
 /** Start the MCP server. Called from the CLI `mcp` subcommand. */
@@ -66,17 +87,14 @@ export async function startMcpServer(dbPath?: string): Promise<void> {
   const searchTool = server.registerTool("codemogger_search", {
     title: "Search Code Index",
     description: buildSearchDescription(initialCurrent),
-    inputSchema: {
-      query: z.string().describe("The search query - natural language for semantic mode, identifier/keyword for keyword mode"),
-      mode: z.enum(["semantic", "keyword"]).default("semantic").describe("Search mode: 'semantic' for conceptual queries, 'keyword' for exact identifier lookup"),
-      limit: z.number().int().min(1).max(50).default(10).describe("Maximum number of results to return"),
-      includeSnippet: z.boolean().default(true).describe("Include the full code snippet in results (can be large)"),
-    },
-  }, async ({ query, mode, limit, includeSnippet }) => {
+    inputSchema: mcpSearchInputSchema,
+  }, async ({ query, mode, limit, includeSnippet, scope, scopeMode }) => {
     const results = await codeIndex.search(query, {
       mode,
       limit,
       includeSnippet,
+      scope,
+      scopeMode: scopeMode as ScopeMode,
     })
 
     if (results.length === 0) {
@@ -91,15 +109,8 @@ export async function startMcpServer(dbPath?: string): Promise<void> {
       }
     }
 
-    const text = results.map((r, i) => {
-      let entry = `${i + 1}. ${r.filePath}:${r.startLine}-${r.endLine}  [${r.kind}] ${r.name}`
-      if (r.signature) entry += `\n   ${r.signature}`
-      if (r.snippet) entry += `\n\`\`\`\n${r.snippet}\n\`\`\``
-      return entry
-    }).join("\n\n")
-
     return {
-      content: [{ type: "text" as const, text }],
+      content: [{ type: "text" as const, text: formatMcpSearchResults(results) }],
     }
   })
 

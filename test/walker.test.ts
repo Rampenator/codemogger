@@ -39,6 +39,44 @@ test("respects .gitignore patterns", async () => {
   expect(files.map(f => f.relPath)).toEqual(["visible.ts"]);
 });
 
+test("respects path-aware excludes", async () => {
+  await writeFile(join(dir, ".gitignore"), "**/custom/generated/**\n");
+  await mkdir(join(dir, "custom", "generated"), { recursive: true });
+  await mkdir(join(dir, "src", "generated"), { recursive: true });
+  await mkdir(join(dir, "app", "src", "generated"), { recursive: true });
+  await writeFile(join(dir, "custom", "generated", "secret.ts"), "export const s = 1;");
+  await writeFile(join(dir, "src", "generated", "root.ts"), "export const r = 1;");
+  await writeFile(join(dir, "app", "src", "generated", "nested.ts"), "export const n = 1;");
+  await writeFile(join(dir, "visible.ts"), "export const v = 1;");
+
+  const { files } = await scanDirectory(dir);
+
+  expect(files.map(f => f.relPath).sort()).toEqual(["visible.ts"]);
+});
+
+test("skips nested duplicate submodule copies but keeps top-level canonical dirs", async () => {
+  await mkdir(join(dir, "shared"), { recursive: true });
+  await mkdir(join(dir, "service", "shared"), { recursive: true });
+  await mkdir(join(dir, "portfolio-admin-ts-models"), { recursive: true });
+  await mkdir(join(dir, "service", "portfolio-admin-ts-models"), { recursive: true });
+  await mkdir(join(dir, "importer-models"), { recursive: true });
+  await mkdir(join(dir, "service", "importer-models"), { recursive: true });
+  await writeFile(join(dir, "shared", "canonical.ts"), "export const shared = 1;");
+  await writeFile(join(dir, "service", "shared", "copy.ts"), "export const sharedCopy = 1;");
+  await writeFile(join(dir, "portfolio-admin-ts-models", "canonical.ts"), "export const pa = 1;");
+  await writeFile(join(dir, "service", "portfolio-admin-ts-models", "copy.ts"), "export const paCopy = 1;");
+  await writeFile(join(dir, "importer-models", "canonical.ts"), "export const im = 1;");
+  await writeFile(join(dir, "service", "importer-models", "copy.ts"), "export const imCopy = 1;");
+
+  const { files } = await scanDirectory(dir);
+
+  expect(files.map(f => f.relPath).sort()).toEqual([
+    "importer-models/canonical.ts",
+    "portfolio-admin-ts-models/canonical.ts",
+    "shared/canonical.ts",
+  ]);
+});
+
 test("does not follow directory symlinks", async () => {
   const target = join(tmpdir(), `codemogger-link-target-${Date.now()}`);
   await mkdir(target);

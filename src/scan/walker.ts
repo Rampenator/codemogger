@@ -30,19 +30,87 @@ const ALWAYS_IGNORE = new Set([
   ".rustup",
 ]);
 
-/** Parse .gitignore-style patterns (simplified: directory names only) */
-function loadIgnorePatterns(content: string): Set<string> {
-  const patterns = new Set<string>();
+const DEFAULT_PATH_EXCLUDES = [
+  "**/src/generated/**",
+];
+
+const NESTED_SUBMODULE_EXCLUDES = new Set([
+  "shared",
+  "portfolio-admin-ts-models",
+  "importer-models",
+]);
+
+interface IgnorePattern {
+  raw: string;
+  hasSlash: boolean;
+  regex: RegExp;
+}
+
+function toSlash(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function globToRegex(pattern: string): RegExp {
+  let out = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        out += ".*";
+        i++;
+      } else {
+        out += "[^/]*";
+      }
+    } else {
+      out += ch.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+    }
+  }
+  return new RegExp(`${out}$`);
+}
+
+/** Parse .gitignore-style patterns used by the scanner. */
+function loadIgnorePatterns(content: string): IgnorePattern[] {
+  const patterns: IgnorePattern[] = [];
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    // Strip trailing slash for directory matching
-    const clean = trimmed.replace(/\/$/, "");
-    if (clean && !clean.includes("*")) {
-      patterns.add(clean);
-    }
+    const clean = toSlash(trimmed).replace(/^\/+/, "").replace(/\/$/, "");
+    if (!clean || clean.startsWith("!")) continue;
+    patterns.push({
+      raw: clean,
+      hasSlash: clean.includes("/"),
+      regex: globToRegex(clean),
+    });
   }
   return patterns;
+}
+
+const DEFAULT_IGNORE_PATTERNS = DEFAULT_PATH_EXCLUDES.map((raw) => ({
+  raw,
+  hasSlash: true,
+  regex: globToRegex(raw),
+}));
+
+function isNestedSubmoduleCopy(relPath: string): boolean {
+  const parts = relPath.split("/").filter(Boolean);
+  return parts.some((part, index) => index > 0 && NESTED_SUBMODULE_EXCLUDES.has(part));
+}
+
+function matchesIgnorePattern(relPath: string, patterns: IgnorePattern[]): boolean {
+  for (const pattern of patterns) {
+    if (pattern.hasSlash) {
+      if (pattern.regex.test(relPath)) return true;
+      if (pattern.raw.startsWith("**/") && globToRegex(pattern.raw.slice(3)).test(relPath)) return true;
+      continue;
+    }
+    if (relPath.split("/").some(part => pattern.regex.test(part))) return true;
+  }
+  return false;
+}
+
+function isExcludedPath(relPath: string, patterns: IgnorePattern[]): boolean {
+  const normalized = toSlash(relPath);
+  return isNestedSubmoduleCopy(normalized) || matchesIgnorePattern(normalized, patterns);
 }
 
 /** Walk a directory tree and return source files with their content and hashes */
@@ -54,10 +122,10 @@ export async function scanDirectory(
   const errors: string[] = [];
 
   // Load .gitignore from root
-  let ignorePatterns = new Set<string>();
+  let ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
   try {
     const gitignore = await readFile(join(rootDir, ".gitignore"), "utf-8");
-    ignorePatterns = loadIgnorePatterns(gitignore);
+    ignorePatterns = ignorePatterns.concat(loadIgnorePatterns(gitignore));
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== "ENOENT") {
@@ -82,10 +150,11 @@ export async function scanDirectory(
 
       // Skip hidden files and always-ignored directories
       if (name.startsWith(".") && name !== ".") continue;
-      if (ALWAYS_IGNORE.has(name)) continue;
-      if (ignorePatterns.has(name)) continue;
-
       const fullPath = join(dir, name);
+      const relPath = toSlash(relative(rootDir, fullPath));
+
+      if (ALWAYS_IGNORE.has(name)) continue;
+      if (isExcludedPath(relPath, ignorePatterns)) continue;
 
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
         await walk(fullPath);
@@ -106,8 +175,6 @@ export async function scanDirectory(
 
         const content = await readFile(fullPath, "utf-8");
         const hash = createHash("sha256").update(content).digest("hex");
-        const relPath = relative(rootDir, fullPath);
-
         files.push({
           absPath: fullPath,
           relPath,

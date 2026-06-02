@@ -7,6 +7,7 @@ import {
   populateFtsForFileSQL,
 } from "./schema.ts"
 import type { CodeChunk } from "../chunk/types.ts"
+import { scopeSqlCondition } from "../search/scope.ts"
 
 // Private row types for database query results — keeps column renames type-safe.
 type CodebaseRow = { id: number; root_path: string; name: string; indexed_at: number; file_count: number; chunk_count: number }
@@ -127,6 +128,10 @@ export class Store {
       const deleteStmt = await this.db.prepare(
         "DELETE FROM chunks WHERE codebase_id = ? AND file_path = ?"
       )
+      const deleteFtsStmt = await this.db.prepare(
+        `DELETE FROM ${ftsTableName(codebaseId)}
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE codebase_id = ? AND file_path = ?)`
+      )
       const insertStmt = await this.db.prepare(`
         INSERT INTO chunks (codebase_id, file_path, chunk_key, language, kind, name, signature, snippet, start_line, end_line, file_hash, indexed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -154,6 +159,7 @@ export class Store {
       `)
 
       for (const { filePath, fileHash, chunks } of fileChunks) {
+        await deleteFtsStmt.run(codebaseId, filePath)
         await deleteStmt.run(codebaseId, filePath)
         for (const chunk of chunks) {
           await insertStmt.run(
@@ -190,12 +196,19 @@ export class Store {
   async removeStaleFiles(codebaseId: number, activeFiles: Set<string>): Promise<number> {
     const all = await (await this.db.prepare("SELECT file_path FROM indexed_files WHERE codebase_id = ?")).all(codebaseId) as { file_path: string }[]
     let removed = 0
+    const deleteFtsStmt = await this.db.prepare(
+      `DELETE FROM ${ftsTableName(codebaseId)}
+       WHERE chunk_id IN (SELECT id FROM chunks WHERE codebase_id = ? AND file_path = ?)`
+    )
+    const deleteChunksStmt = await this.db.prepare("DELETE FROM chunks WHERE codebase_id = ? AND file_path = ?")
+    const deleteFileStmt = await this.db.prepare("DELETE FROM indexed_files WHERE codebase_id = ? AND file_path = ?")
     await this.db.exec("BEGIN")
     try {
       for (const row of all) {
         if (!activeFiles.has(row.file_path)) {
-          await (await this.db.prepare("DELETE FROM chunks WHERE codebase_id = ? AND file_path = ?")).run(codebaseId, row.file_path)
-          await (await this.db.prepare("DELETE FROM indexed_files WHERE codebase_id = ? AND file_path = ?")).run(codebaseId, row.file_path)
+          await deleteFtsStmt.run(codebaseId, row.file_path)
+          await deleteChunksStmt.run(codebaseId, row.file_path)
+          await deleteFileStmt.run(codebaseId, row.file_path)
           removed++
         }
       }
@@ -281,23 +294,25 @@ export class Store {
   // ── Search ───────────────────────────────────────────────────────
 
   /** Vector search across all codebases (global) */
-  async vectorSearch(queryEmbedding: number[], limit: number, includeSnippet: boolean): Promise<SearchResult[]> {
+  async vectorSearch(queryEmbedding: number[], limit: number, includeSnippet: boolean, scope?: string): Promise<SearchResult[]> {
     const json = JSON.stringify(queryEmbedding)
+    const scopeWhere = scope ? scopeSqlCondition("file_path", scope) : null
     const sql = includeSnippet
       ? `SELECT chunk_key, file_path, name, kind, signature, snippet, start_line, end_line,
                 vector_distance_cos(embedding, vector8(?)) AS distance
          FROM chunks
-         WHERE embedding IS NOT NULL
+         WHERE embedding IS NOT NULL${scopeWhere ? ` AND ${scopeWhere.sql}` : ""}
          ORDER BY distance ASC
          LIMIT ?`
       : `SELECT chunk_key, file_path, name, kind, signature, start_line, end_line,
                 vector_distance_cos(embedding, vector8(?)) AS distance
          FROM chunks
-         WHERE embedding IS NOT NULL
+         WHERE embedding IS NOT NULL${scopeWhere ? ` AND ${scopeWhere.sql}` : ""}
          ORDER BY distance ASC
          LIMIT ?`
 
-    const rows = await (await this.db.prepare(sql)).all(json, limit) as VectorSearchRow[]
+    const params = scopeWhere ? [json, ...scopeWhere.params, limit] : [json, limit]
+    const rows = await (await this.db.prepare(sql)).all(...params) as VectorSearchRow[]
 
     return rows.map((row) => ({
       chunkKey: row.chunk_key,
@@ -313,7 +328,7 @@ export class Store {
   }
 
   /** FTS search across all codebases (queries each FTS table, merges results) */
-  async ftsSearch(query: string, limit: number, includeSnippet: boolean): Promise<SearchResult[]> {
+  async ftsSearch(query: string, limit: number, includeSnippet: boolean, scope?: string): Promise<SearchResult[]> {
     // Discover existing FTS tables in a single query instead of checking each codebase
     const ftsTables = await (await this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'fts_*'")).all() as { name: string }[]
 
@@ -323,14 +338,15 @@ export class Store {
       try {
         // Join FTS scores with chunk data in a single query (avoids per-row lookups)
         const snippetCol = includeSnippet ? "c.snippet," : ""
+        const scopeWhere = scope ? scopeSqlCondition("c.file_path", scope) : null
         const rows = await (await this.db.prepare(`SELECT c.chunk_key, c.file_path, c.name, c.kind, c.signature,
                   ${snippetCol} c.start_line, c.end_line,
                   fts_score(f.name, f.signature, ?1) AS score
            FROM ${table} f
            JOIN chunks c ON c.id = f.chunk_id
-           WHERE fts_match(f.name, f.signature, ?1)
+           WHERE fts_match(f.name, f.signature, ?1)${scopeWhere ? ` AND ${scopeWhere.sql}` : ""}
            ORDER BY score DESC
-           LIMIT ?`)).all(query, limit) as (ChunkDataRow & { score: number; snippet?: string })[]
+           LIMIT ?`)).all(query, ...(scopeWhere?.params ?? []), limit) as (ChunkDataRow & { score: number; snippet?: string })[]
 
         for (const row of rows) {
           allResults.push({
