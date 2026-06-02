@@ -8,6 +8,7 @@ import {
 } from "./schema.ts"
 import type { CodeChunk } from "../chunk/types.ts"
 import { scopeSqlCondition } from "../search/scope.ts"
+import { openDbWithRetry } from "./safety.ts"
 
 // Private row types for database query results — keeps column renames type-safe.
 type CodebaseRow = { id: number; root_path: string; name: string; indexed_at: number; file_count: number; chunk_count: number }
@@ -52,10 +53,11 @@ export class Store {
     this.db = db
   }
 
-  static async open(dbPath: string): Promise<Store> {
-    const db = await connect(dbPath, {
+  static async open(dbPath: string, opts?: { opener?: typeof connect; retryDelaysMs?: number[] }): Promise<Store> {
+    const opener = opts?.opener ?? connect
+    const db = await openDbWithRetry(dbPath, () => opener(dbPath, {
       experimental: ["index_method", "multiprocess_wal"],
-    })
+    }), opts?.retryDelaysMs)
     const store = new Store(db)
     await store.init()
     return store

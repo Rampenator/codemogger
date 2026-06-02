@@ -12,6 +12,8 @@ import { detectLanguage } from "./chunk/languages.ts";
 import { preprocessQuery, type QueryMode } from "./search/query.ts";
 import { rrfMerge } from "./search/rank.ts";
 import { applyScope, type ScopeMode } from "./search/scope.ts";
+import { buildSchemaSnapshotArtifacts } from "./schema/snapshot.ts";
+import { withDbWriterLock } from "./db/safety.ts";
 import type { Embedder } from "./embed/types.ts";
 
 export type { SearchResult, IndexedFile, Codebase } from "./db/store.ts";
@@ -55,6 +57,16 @@ export interface IndexResult {
   duration: number;
 }
 
+export interface SchemaIndexResult {
+  tables: number;
+  chunks: number;
+  embedded: number;
+  artifactDir: string;
+  chunksPath: string;
+  manifestPath: string;
+  duration: number;
+}
+
 export interface CodeIndexOptions {
   dbPath: string;
   /** Embedding function - SDK users must provide their own */
@@ -90,8 +102,30 @@ export class CodeIndex {
     return this.store;
   }
 
+  private buildEmbedText(s: {
+    filePath: string;
+    kind: string;
+    name: string;
+    signature: string;
+    snippet: string;
+  }): string {
+    let text = s.filePath;
+    if (s.kind && s.name) text += `: ${s.kind} ${s.name}`;
+    else if (s.name) text += `: ${s.name}`;
+    if (s.signature) text += `\n${s.signature}`;
+    if (s.snippet) {
+      const preview = s.snippet.slice(0, 500);
+      text += `\n${preview}`;
+    }
+    return text;
+  }
+
   /** Index a directory: scan files, chunk with tree-sitter, embed, store */
   async index(dir: string, opts?: IndexOptions): Promise<IndexResult> {
+    return withDbWriterLock(this.dbPath, () => this.indexUnlocked(dir, opts));
+  }
+
+  private async indexUnlocked(dir: string, opts?: IndexOptions): Promise<IndexResult> {
     const start = performance.now();
     const store = await this.getStore();
     const rootDir = resolve(dir);
@@ -143,25 +177,6 @@ export class CodeIndex {
         filesToProcess.push(file);
       }
       progress({ phase: "hash", current: fi + 1, total: files.length });
-    }
-
-    // Build embedding text for a chunk
-    function buildEmbedText(s: {
-      filePath: string;
-      kind: string;
-      name: string;
-      signature: string;
-      snippet: string;
-    }): string {
-      let text = s.filePath;
-      if (s.kind && s.name) text += `: ${s.kind} ${s.name}`;
-      else if (s.name) text += `: ${s.name}`;
-      if (s.signature) text += `\n${s.signature}`;
-      if (s.snippet) {
-        const preview = s.snippet.slice(0, 500);
-        text += `\n${preview}`;
-      }
-      return text;
     }
 
     // Process in streaming batches: chunk → write
@@ -228,7 +243,7 @@ export class CodeIndex {
 
       for (let i = 0; i < stale.length; i += EMBED_BATCH) {
         const slice = stale.slice(i, i + EMBED_BATCH);
-        const texts = slice.map(buildEmbedText);
+        const texts = slice.map(s => this.buildEmbedText(s));
         try {
           const vectors = await this.embedder(texts);
           await store.batchUpsertEmbeddings(
@@ -281,6 +296,66 @@ export class CodeIndex {
       removed,
       errors,
       duration,
+    };
+  }
+
+  async indexSchemaSnapshot(sourceDir: string): Promise<SchemaIndexResult> {
+    return withDbWriterLock(this.dbPath, () => this.indexSchemaSnapshotUnlocked(sourceDir));
+  }
+
+  private async indexSchemaSnapshotUnlocked(sourceDir: string): Promise<SchemaIndexResult> {
+    const start = performance.now();
+    const artifacts = await buildSchemaSnapshotArtifacts(sourceDir, this.dbPath);
+    const store = await this.getStore();
+    const codebaseId = await store.getOrCreateCodebase(`schema:${resolve(sourceDir)}`, "database-schema");
+    await store.ensureFtsTable(codebaseId);
+
+    const chunks = artifacts.chunks.map((chunk, index) => ({
+      chunkKey: `${artifacts.chunksPath}:${chunk.name}`,
+      filePath: artifacts.chunksPath,
+      language: "database_schema",
+      kind: chunk.kind,
+      name: chunk.name,
+      signature: chunk.signature,
+      snippet: chunk.snippet,
+      startLine: index + 1,
+      endLine: index + 1,
+      fileHash: artifacts.chunksHash,
+    }));
+
+    await store.batchUpsertAllFileChunks(codebaseId, [{
+      filePath: artifacts.chunksPath,
+      fileHash: artifacts.chunksHash,
+      chunks,
+    }]);
+    await store.populateFtsForFiles(codebaseId, [artifacts.chunksPath]);
+
+    const stale = await store.getStaleEmbeddings(codebaseId, this.embeddingModel);
+    let embedded = 0;
+    for (let i = 0; i < stale.length; i += 64) {
+      const slice = stale.slice(i, i + 64);
+      const vectors = await this.embedder(slice.map(s => this.buildEmbedText(s)));
+      await store.batchUpsertEmbeddings(
+        slice.map((s, j) => ({
+          chunkKey: s.chunkKey,
+          embedding: vectors[j]!,
+          modelName: this.embeddingModel,
+        })),
+      );
+      embedded += vectors.length;
+    }
+
+    await store.optimizeFts(codebaseId);
+    await store.touchCodebase(codebaseId);
+
+    return {
+      tables: artifacts.chunks.length,
+      chunks: chunks.length,
+      embedded,
+      artifactDir: artifacts.artifactDir,
+      chunksPath: artifacts.chunksPath,
+      manifestPath: artifacts.manifestPath,
+      duration: Math.round(performance.now() - start),
     };
   }
 

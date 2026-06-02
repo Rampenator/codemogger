@@ -3,6 +3,7 @@ import { mkdir, writeFile, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { CodeIndex } from "../src/index.ts";
+import { withDbWriterLock } from "../src/db/safety.ts";
 
 let dir: string;
 
@@ -122,5 +123,16 @@ test("scoped search supports global boost and filter", async () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results.every(r => r.filePath.includes("/service-a/"))).toBe(true);
   }
+  await idx.close();
+});
+
+test("index fails fast when another writer holds the DB lock", async () => {
+  await writeFile(join(dir, "foo.ts"), "export function hello() {}");
+  const dbPath = join(dir, "test.db");
+  const idx = makeIndex(dbPath);
+
+  await withDbWriterLock(dbPath, async () => {
+    await expect(idx.index(dir)).rejects.toThrow("Another Codemogger writer is active");
+  });
   await idx.close();
 });

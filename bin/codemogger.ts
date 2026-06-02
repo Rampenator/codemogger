@@ -3,10 +3,18 @@ import { program } from "commander"
 import { CodeIndex, projectDbPath, type SearchMode, type IndexProgress } from "../src/index.ts"
 import type { ScopeMode } from "../src/search/scope.ts"
 import { localEmbed, LOCAL_MODEL_NAME } from "../src/embed/local.ts"
+import type { Embedder } from "../src/embed/types.ts"
 import { formatJson } from "../src/format/json.ts"
 import { formatText } from "../src/format/text.ts"
 
 const isTTY = process.stderr.isTTY
+
+function cliEmbedder(): Embedder {
+  if (process.env.CODEMOGGER_TEST_EMBEDDINGS === "1") {
+    return async (texts: string[]) => texts.map(() => Array.from({ length: 384 }, () => 0))
+  }
+  return localEmbed
+}
 
 /** OSC 9;4 terminal progress — works in Ghostty, Windows Terminal, Konsole, WezTerm, kitty, etc. */
 function oscProgress(state: 0 | 1 | 2 | 3, percent?: number) {
@@ -88,7 +96,7 @@ program
   .option("--verbose", "show detailed indexing progress")
   .action(async (dir: string, opts: { language?: string; verbose?: boolean }) => {
     const dbPath = resolveDbPath(dir)
-    const db = new CodeIndex({ dbPath, embedder: localEmbed, embeddingModel: LOCAL_MODEL_NAME })
+    const db = new CodeIndex({ dbPath, embedder: cliEmbedder(), embeddingModel: LOCAL_MODEL_NAME })
     try {
       const result = await db.index(dir, {
         languages: opts.language ? [opts.language] : undefined,
@@ -133,7 +141,7 @@ program
   .option("--scope-mode <mode>", "scope mode: global|boost|filter", "global")
   .action(async (query: string, opts: { limit: string; threshold: string; format: string; snippet?: boolean; mode: string; scope?: string; scopeMode: string }) => {
     const dbPath = resolveDbPath()
-    const db = new CodeIndex({ dbPath, embedder: localEmbed, embeddingModel: LOCAL_MODEL_NAME })
+    const db = new CodeIndex({ dbPath, embedder: cliEmbedder(), embeddingModel: LOCAL_MODEL_NAME })
     try {
       const start = performance.now()
       const results = await db.search(query, {
@@ -166,7 +174,7 @@ program
   .option("--format <fmt>", "output format: json|text", "text")
   .action(async (opts: { format: string }) => {
     const dbPath = resolveDbPath()
-    const db = new CodeIndex({ dbPath, embedder: localEmbed, embeddingModel: LOCAL_MODEL_NAME })
+    const db = new CodeIndex({ dbPath, embedder: cliEmbedder(), embeddingModel: LOCAL_MODEL_NAME })
     try {
       const files = await db.listFiles()
 
@@ -183,6 +191,30 @@ program
           console.log(`  ${f.filePath} (${f.chunkCount} chunks)`)
         }
       }
+    } finally {
+      await db.close()
+    }
+  })
+
+program
+  .command("schema")
+  .description("Work with explicit database schema snapshots")
+  .command("index")
+  .description("Index a local database schema snapshot")
+  .requiredOption("--source <dir>", "snapshot directory containing CSV exports and manifest.json")
+  .option("--db <path>", "codemogger database path; derived artifacts go under dirname(db)/schema")
+  .action(async (opts: { source: string; db: string }) => {
+    const dbPath = opts.db ?? program.opts().db
+    if (!dbPath) throw new Error("schema index requires --db <path>")
+    const db = new CodeIndex({ dbPath, embedder: cliEmbedder(), embeddingModel: LOCAL_MODEL_NAME })
+    try {
+      const result = await db.indexSchemaSnapshot(opts.source)
+      console.log(
+        `Indexed schema snapshot: ${result.tables} table${result.tables !== 1 ? "s" : ""} → ` +
+        `${result.chunks} chunk${result.chunks !== 1 ? "s" : ""}, ` +
+        `embedded ${result.embedded} (${result.duration}ms)\n` +
+        `Artifacts: ${result.chunksPath}, ${result.manifestPath}`
+      )
     } finally {
       await db.close()
     }
